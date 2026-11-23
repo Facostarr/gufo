@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <gufo/ext/experimental/state_memory.hpp>
+#include <gufo/ext/snapshot_copy.hpp>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -114,9 +116,23 @@ std::size_t StateLayout::SessionBytes(std::uint32_t context) const {
 // SessionStateAccess: the one place that knows the Session buffer layout.
 namespace {
 void Check(hipError_t e, const char* what) {
-  if (e != hipSuccess)
+  if (e != hipSuccess) {
+    // Clear it: the next launch check on this thread would report it.
+    (void)hipGetLastError();
     throw std::runtime_error(std::string("inkling2 state copy: ") + what +
                              ": " + hipGetErrorString(e));
+  }
+}
+// Each 2 MiB page of a demand-mapped region is its own allocation, and HIP's
+// copies on Windows reject a device range that spans two. Global visits are
+// page-aligned regions of whole rows: no piece crosses a page boundary.
+constexpr std::size_t kRowsPerPage = mem::kPageBytes / kKvRowBytes;
+static_assert(mem::kPageBytes % kKvRowBytes == 0);
+// Waits for the pieces queued on the engine's default stream, after a failed
+// submission too: callers reuse the buffers once a copy returns.
+void Settle(hipError_t submitted, const char* what) {
+  const hipError_t settled = hipStreamSynchronize(nullptr);
+  Check(submitted != hipSuccess ? submitted : settled, what);
 }
 }  // namespace
 
@@ -149,20 +165,21 @@ void SessionStateAccess::RowsOut(const Session& s, std::uint32_t visit,
   const auto& sl = s.slots_.at(visit);
   const auto* base = static_cast<const std::byte*>(value ? sl.v : sl.k);
   const bool ring = !sl.global;
-  while (first < end) {
+  hipError_t copied = hipSuccess;
+  const std::shared_lock<std::shared_mutex> gate(CaptureGate());
+  while (first < end && copied == hipSuccess) {
     const std::size_t slot_row = ring ? first % sl.rows : first;
-    const std::size_t n =
-        ring ? std::min<std::size_t>(end - first, sl.rows - slot_row)
-             : end - first;
+    const std::size_t n = std::min<std::size_t>(
+        end - first,
+        ring ? sl.rows - slot_row : kRowsPerPage - slot_row % kRowsPerPage);
     if (!ring && end > sl.rows)
       throw std::invalid_argument("inkling2: row range beyond capacity");
-    const std::shared_lock<std::shared_mutex> gate(CaptureGate());
-    Check(hipMemcpy(dst, base + slot_row * kKvRowBytes, n * kKvRowBytes,
-                    hipMemcpyDeviceToHost),
-          "rows out");
+    copied = gufo::hip::CopySnapshotToHost(dst, base + slot_row * kKvRowBytes,
+                                           n * kKvRowBytes, nullptr);
     dst += n * kKvRowBytes;
     first += n;
   }
+  Settle(copied, "rows out");
 }
 
 void SessionStateAccess::RowsIn(Session& s, std::uint32_t visit, bool value,
@@ -180,20 +197,21 @@ void SessionStateAccess::RowsIn(Session& s, std::uint32_t visit, bool value,
       throw std::invalid_argument("inkling2: row range beyond capacity");
     s.EnsureRows(end);  // BeginRestore made the pages private
   }
-  while (first < end) {
+  hipError_t copied = hipSuccess;
+  const std::shared_lock<std::shared_mutex> gate(CaptureGate());
+  while (first < end && copied == hipSuccess) {
     const std::size_t slot_row = ring ? first % sl.rows : first;
-    const std::size_t n =
-        ring ? std::min<std::size_t>(end - first, sl.rows - slot_row)
-             : end - first;
+    const std::size_t n = std::min<std::size_t>(
+        end - first,
+        ring ? sl.rows - slot_row : kRowsPerPage - slot_row % kRowsPerPage);
     if (!ring && end > sl.rows)
       throw std::invalid_argument("inkling2: row range beyond capacity");
-    const std::shared_lock<std::shared_mutex> gate(CaptureGate());
-    Check(hipMemcpy(base + slot_row * kKvRowBytes, src, n * kKvRowBytes,
-                    hipMemcpyDefault),
-          "rows in");
+    copied = gufo::hip::CopySnapshotToDevice(base + slot_row * kKvRowBytes, src,
+                                             n * kKvRowBytes, nullptr);
     src += n * kKvRowBytes;
     first += n;
   }
+  Settle(copied, "rows in");
 }
 
 std::span<const std::byte> SessionStateAccess::RowsView(const Session& s,

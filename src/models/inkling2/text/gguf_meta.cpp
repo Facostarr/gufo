@@ -1,7 +1,7 @@
 #include "src/models/inkling2/text/gguf_meta.hpp"
 
-#include <cstdio>
 #include <cstring>
+#include <gufo/ext/platform/mapped_file.hpp>
 #include <memory>
 
 namespace inkling2::text {
@@ -24,16 +24,25 @@ enum Type : std::uint32_t {
   kF64
 };
 
+// Sequential reads over a read-only mapping, portable to Windows. Read and
+// Skip fail rather than move past the end of the file.
 struct File {
-  std::FILE* f{nullptr};
-  explicit File(const std::string& p) : f(std::fopen(p.c_str(), "rb")) {}
-  ~File() {
-    if (f != nullptr)
-      std::fclose(f);
+  ::gufo::platform::ReadOnlyMappedFile map;
+  std::size_t pos{0};
+  explicit File(const std::string& p)
+      : map(::gufo::platform::ReadOnlyMappedFile::Open(p)) {}
+  bool Read(void* dst, std::size_t n) {
+    if (n > map.size() - pos)
+      return false;
+    std::memcpy(dst, map.data() + pos, n);
+    pos += n;
+    return true;
   }
-  bool Read(void* dst, std::size_t n) { return std::fread(dst, 1, n, f) == n; }
   bool Skip(std::uint64_t n) {
-    return fseeko(f, static_cast<off_t>(n), SEEK_CUR) == 0;
+    if (n > map.size() - pos)
+      return false;
+    pos += static_cast<std::size_t>(n);
+    return true;
   }
   template<typename T>
   bool Get(T* v) {
@@ -155,7 +164,7 @@ bool ReadTokenizerDataFromGguf(const std::string& path, TokenizerData* out,
     return false;
   };
   File f(path);
-  if (f.f == nullptr)
+  if (!f.map.valid())
     return fail("cannot open");
   char magic[4];
   std::uint32_t version;

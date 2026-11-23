@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "name": "inkling2",
+  "target": "gufo_inkling2",
+  "kind": "static",
+  "purpose": "Inkling 2 Mini text and vision runtime on its own HIP kernels, with DSpark speculative decoding.",
+  "consumers": []
+}

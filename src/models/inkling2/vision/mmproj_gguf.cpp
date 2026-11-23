@@ -1,10 +1,5 @@
 #include "mmproj_gguf.hpp"
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <cstring>
 
 namespace gufo::models::inkling2::vision {
@@ -90,34 +85,17 @@ uint64_t TypeBytes(int type, uint64_t n) {
 
 }  // namespace
 
-MmprojGguf::~MmprojGguf() {
-  if (map_)
-    munmap(map_, size_);
-}
-
 bool MmprojGguf::Open(const std::string& path, std::string* err) {
   auto fail = [&](const std::string& m) {
     if (err)
       *err = m;
     return false;
   };
-  int fd = open(path.c_str(), O_RDONLY);
-  if (fd < 0)
-    return fail("cannot open " + path);
-  struct stat st;
-  if (fstat(fd, &st) != 0) {
-    close(fd);
-    return fail("stat failed");
-  }
-  size_ = static_cast<uint64_t>(st.st_size);
-  map_ = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
-  close(fd);
-  if (map_ == MAP_FAILED) {
-    map_ = nullptr;
-    return fail("mmap failed");
-  }
-  Cur c{static_cast<const uint8_t*>(map_),
-        static_cast<const uint8_t*>(map_) + size_};
+  std::string open_error;
+  map_ = platform::ReadOnlyMappedFile::Open(path, &open_error);
+  if (!map_.valid())
+    return fail("cannot open " + path + ": " + open_error);
+  Cur c{map_.data(), map_.data() + map_.size()};
   if (c.Get<uint32_t>() != 0x46554747u)
     return fail("not a GGUF file");
   uint32_t ver = c.Get<uint32_t>();
@@ -167,7 +145,7 @@ bool MmprojGguf::Open(const std::string& path, std::string* err) {
   }
   if (!c.ok)
     return fail("truncated GGUF header");
-  uint64_t hdr = static_cast<uint64_t>(c.p - static_cast<const uint8_t*>(map_));
+  uint64_t hdr = static_cast<uint64_t>(c.p - map_.data());
   uint64_t data0 = (hdr + align - 1) / align * align;
   for (auto& in : infos) {
     MmprojTensor t;
@@ -178,9 +156,9 @@ bool MmprojGguf::Open(const std::string& path, std::string* err) {
     if (t.nbytes == 0)
       return fail("unsupported tensor type " + std::to_string(in.type) +
                   " for " + in.name);
-    if (data0 + in.off + t.nbytes > size_)
+    if (data0 + in.off + t.nbytes > map_.size())
       return fail("tensor out of range: " + in.name);
-    t.data = static_cast<const uint8_t*>(map_) + data0 + in.off;
+    t.data = map_.data() + data0 + in.off;
     tensors_[t.name] = std::move(t);
   }
   return true;
